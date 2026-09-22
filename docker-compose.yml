@@ -6,6 +6,7 @@ services:
       - "2222:22"
     volumes:
       - ssh-host-keys:/etc/ssh
+      - ./logs/ssh-target:/var/log
     networks:
       - soc-net
 
@@ -17,9 +18,24 @@ services:
     tty: true
     stdin_open: true
 
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      - POSTGRES_USER=soc
+      - POSTGRES_PASSWORD=socpassword
+      - POSTGRES_DB=soc
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    networks:
+      - soc-net
+
 networks:
   soc-net:
     driver: bridge
 
 volumes:
   ssh-host-keys:
+  pg-data:
