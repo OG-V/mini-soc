@@ -9,6 +9,14 @@ services:
     networks:
       - soc-net
 
+  attacker:
+    build: ./attacker
+    container_name: attacker
+    networks:
+      - soc-net
+    tty: true
+    stdin_open: true
+
 networks:
   soc-net:
     driver: bridge
