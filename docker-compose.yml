@@ -1,0 +1,17 @@
+services:
+  ssh-target:
+    build: .
+    container_name: ssh-target
+    ports:
+      - "2222:22"
+    volumes:
+      - ssh-host-keys:/etc/ssh
+    networks:
+      - soc-net
+
+networks:
+  soc-net:
+    driver: bridge
+
+volumes:
+  ssh-host-keys:
