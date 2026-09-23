@@ -13,9 +13,9 @@ DB_CONFIG = {
 # Rule parameters: N failed logins from the same IP within this many seconds
 FAILED_LOGIN_THRESHOLD = 4
 TIME_WINDOW_SECONDS = 60
-
 POLL_INTERVAL_SECONDS = 5
-
+RECON_THRESHOLD = 2
+RECON_WINDOW_SECONDS = 60
 
 def find_brute_force_candidates(conn):
     """
@@ -42,6 +42,55 @@ def find_brute_force_candidates(conn):
         )
         return cur.fetchall()
 
+def find_recon_candidates(conn):
+    """
+    Groups recent, not-yet-alerted ssh_recon_probe events by source_ip,
+    returning IPs that cross the threshold within the time window.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT source_ip,
+                   COUNT(*) AS probe_count,
+                   MIN(id) AS first_id,
+                   MAX(id) AS last_id,
+                   array_agg(id) AS event_ids
+            FROM events
+            WHERE event_type = 'ssh_recon_probe'
+              AND alerted = FALSE
+              AND event_time > now() - (%s || ' seconds')::interval
+            GROUP BY source_ip
+            HAVING COUNT(*) >= %s
+            """,
+            (RECON_WINDOW_SECONDS, RECON_THRESHOLD),
+        )
+        return cur.fetchall()
+
+
+def create_recon_alert(conn, source_ip, probe_count, first_id, last_id, event_ids):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO alerts (rule_name, mitre_technique, source_ip, username,
+                                 description, first_event_id, last_event_id, event_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                "ssh_recon_scan",
+                "T1595",
+                source_ip,
+                None,
+                f"{probe_count} SSH banner-grab/recon probes from {source_ip} within {RECON_WINDOW_SECONDS}s",
+                first_id,
+                last_id,
+                probe_count,
+            ),
+        )
+        cur.execute(
+            "UPDATE events SET alerted = TRUE WHERE id = ANY(%s)",
+            (event_ids,),
+        )
+    conn.commit()
 
 def create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, username):
     with conn.cursor() as cur:
@@ -69,18 +118,22 @@ def create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, u
         )
     conn.commit()
 
-
 def run():
     conn = psycopg2.connect(**DB_CONFIG)
-    print("Detection engine started. Polling for brute-force patterns...")
+    print("Detection engine started. Polling for brute-force and recon patterns...")
     while True:
         candidates = find_brute_force_candidates(conn)
         for source_ip, failure_count, first_id, last_id, event_ids, usernames in candidates:
             username = usernames[0]
             create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, username)
             print(f"ALERT: ssh_brute_force from {source_ip} ({failure_count} failures)")
-        time.sleep(POLL_INTERVAL_SECONDS)
 
+        recon_candidates = find_recon_candidates(conn)
+        for source_ip, probe_count, first_id, last_id, event_ids in recon_candidates:
+            create_recon_alert(conn, source_ip, probe_count, first_id, last_id, event_ids)
+            print(f"ALERT: ssh_recon_scan from {source_ip} ({probe_count} probes)")
+
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
     run()
