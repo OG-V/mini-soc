@@ -16,6 +16,8 @@ TIME_WINDOW_SECONDS = 60
 POLL_INTERVAL_SECONDS = 5
 RECON_THRESHOLD = 2
 RECON_WINDOW_SECONDS = 60
+WEB_ATTACK_THRESHOLD = 3
+WEB_ATTACK_WINDOW_SECONDS = 60
 
 def find_brute_force_candidates(conn):
     """
@@ -92,6 +94,56 @@ def create_recon_alert(conn, source_ip, probe_count, first_id, last_id, event_id
         )
     conn.commit()
 
+def find_web_attack_candidates(conn):
+    """
+    Groups recent, not-yet-alerted http_suspicious_request events by source_ip,
+    returning IPs that cross the threshold within the time window.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT source_ip,
+                   COUNT(*) AS request_count,
+                   MIN(id) AS first_id,
+                   MAX(id) AS last_id,
+                   array_agg(id) AS event_ids
+            FROM events
+            WHERE event_type = 'http_suspicious_request'
+              AND alerted = FALSE
+              AND event_time > now() - (%s || ' seconds')::interval
+            GROUP BY source_ip
+            HAVING COUNT(*) >= %s
+            """,
+            (WEB_ATTACK_WINDOW_SECONDS, WEB_ATTACK_THRESHOLD),
+        )
+        return cur.fetchall()
+
+
+def create_web_attack_alert(conn, source_ip, request_count, first_id, last_id, event_ids):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO alerts (rule_name, mitre_technique, source_ip, username,
+                                 description, first_event_id, last_event_id, event_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                "web_attack_probing",
+                "T1190",
+                source_ip,
+                None,
+                f"{request_count} suspicious HTTP requests from {source_ip} within {WEB_ATTACK_WINDOW_SECONDS}s",
+                first_id,
+                last_id,
+                request_count,
+            ),
+        )
+        cur.execute(
+            "UPDATE events SET alerted = TRUE WHERE id = ANY(%s)",
+            (event_ids,),
+        )
+    conn.commit()
+
 def create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, username):
     with conn.cursor() as cur:
         cur.execute(
@@ -120,7 +172,7 @@ def create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, u
 
 def run():
     conn = psycopg2.connect(**DB_CONFIG)
-    print("Detection engine started. Polling for brute-force and recon patterns...")
+    print("Detection engine started. Polling for brute-force, recon, and web attack patterns...")
     while True:
         candidates = find_brute_force_candidates(conn)
         for source_ip, failure_count, first_id, last_id, event_ids, usernames in candidates:
@@ -132,6 +184,11 @@ def run():
         for source_ip, probe_count, first_id, last_id, event_ids in recon_candidates:
             create_recon_alert(conn, source_ip, probe_count, first_id, last_id, event_ids)
             print(f"ALERT: ssh_recon_scan from {source_ip} ({probe_count} probes)")
+
+        web_candidates = find_web_attack_candidates(conn)
+        for source_ip, request_count, first_id, last_id, event_ids in web_candidates:
+            create_web_attack_alert(conn, source_ip, request_count, first_id, last_id, event_ids)
+            print(f"ALERT: web_attack_probing from {source_ip} ({request_count} requests)")
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
