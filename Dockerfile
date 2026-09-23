@@ -15,4 +15,4 @@ RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/
 EXPOSE 22
 
 # Start rsyslog (so sshd's syslog messages land in /var/log/auth.log), then sshd in the foreground
-CMD ssh-keygen -A && rsyslogd && /usr/sbin/sshd -D
+CMD ssh-keygen -A && rm -f /run/rsyslogd.pid && rsyslogd && /usr/sbin/sshd -D
