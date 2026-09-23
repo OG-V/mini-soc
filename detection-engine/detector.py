@@ -19,9 +19,8 @@ POLL_INTERVAL_SECONDS = 5
 
 def find_brute_force_candidates(conn):
     """
-    Groups recent ssh_failed_login events by source_ip, counting how many
-    occurred within the time window, and returns IPs that cross the threshold
-    and don't already have an alert covering their most recent failed event.
+    Groups recent, not-yet-alerted ssh_failed_login events by source_ip,
+    returning IPs that cross the threshold within the time window.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -30,14 +29,12 @@ def find_brute_force_candidates(conn):
                    COUNT(*) AS failure_count,
                    MIN(id) AS first_id,
                    MAX(id) AS last_id,
+                   array_agg(id) AS event_ids,
                    array_agg(username ORDER BY id DESC) AS usernames
             FROM events
             WHERE event_type = 'ssh_failed_login'
+              AND alerted = FALSE
               AND event_time > now() - (%s || ' seconds')::interval
-              AND id NOT IN (
-                  SELECT last_event_id FROM alerts
-                  WHERE rule_name = 'ssh_brute_force' AND last_event_id IS NOT NULL
-              )
             GROUP BY source_ip
             HAVING COUNT(*) >= %s
             """,
@@ -46,7 +43,7 @@ def find_brute_force_candidates(conn):
         return cur.fetchall()
 
 
-def create_alert(conn, source_ip, failure_count, first_id, last_id, username):
+def create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, username):
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -65,6 +62,11 @@ def create_alert(conn, source_ip, failure_count, first_id, last_id, username):
                 failure_count,
             ),
         )
+        # Mark every event that contributed to this alert so it's never double-counted
+        cur.execute(
+            "UPDATE events SET alerted = TRUE WHERE id = ANY(%s)",
+            (event_ids,),
+        )
     conn.commit()
 
 
@@ -73,9 +75,9 @@ def run():
     print("Detection engine started. Polling for brute-force patterns...")
     while True:
         candidates = find_brute_force_candidates(conn)
-        for source_ip, failure_count, first_id, last_id, usernames in candidates:
+        for source_ip, failure_count, first_id, last_id, event_ids, usernames in candidates:
             username = usernames[0]
-            create_alert(conn, source_ip, failure_count, first_id, last_id, username)
+            create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, username)
             print(f"ALERT: ssh_brute_force from {source_ip} ({failure_count} failures)")
         time.sleep(POLL_INTERVAL_SECONDS)
 
