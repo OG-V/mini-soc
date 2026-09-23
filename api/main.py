@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
 import psycopg2.extras
 
@@ -11,6 +12,13 @@ DB_CONFIG = {
 }
 
 app = FastAPI(title="Mini SOC API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def get_connection():
@@ -61,3 +69,21 @@ def get_alert(alert_id: int):
     conn.close()
     alert["events"] = events
     return alert
+
+@app.get("/events")
+def list_events(limit: int = 50):
+    """Return the most recent raw events, newest first."""
+    conn = get_connection()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, event_type, username, source_ip, raw_log, event_time, alerted
+            FROM events
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    conn.close()
+    return rows
