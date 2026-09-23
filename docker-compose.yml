@@ -32,6 +32,16 @@ services:
     networks:
       - soc-net
 
+  web-target:
+    image: nginx:alpine
+    container_name: web-target
+    ports:
+      - "8080:80"
+    volumes:
+      - ./logs/web-target:/var/log/nginx
+    networks:
+      - soc-net
+
 networks:
   soc-net:
     driver: bridge

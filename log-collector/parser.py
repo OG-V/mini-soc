@@ -1,6 +1,8 @@
 import re
 import time
+import threading
 from datetime import datetime, timezone
+from urllib.parse import unquote
 import psycopg2
 
 DB_CONFIG = {
@@ -11,29 +13,25 @@ DB_CONFIG = {
     "password": "socpassword",
 }
 
-# Matches lines like:
-# Sep 22 21:19:04 hostname sshd[33]: Failed password for testuser from 172.18.0.3 port 60338 ssh2
+# ---------------------------------------------------------------------------
+# SSH log parsing (auth.log)
+# ---------------------------------------------------------------------------
+
 FAILED_LOGIN_RE = re.compile(
     r"^(?P<timestamp>\w+ +\d+ \d+:\d+:\d+) (?P<host>\S+) sshd\[\d+\]: "
     r"Failed password for (?P<user>\S+) from (?P<ip>\S+) port \d+"
 )
 
-# Matches lines like:
-# Sep 22 21:19:04 hostname sshd[34]: Accepted password for testuser from 172.18.0.3 port 60330 ssh2
 ACCEPTED_LOGIN_RE = re.compile(
     r"^(?P<timestamp>\w+ +\d+ \d+:\d+:\d+) (?P<host>\S+) sshd\[\d+\]: "
     r"Accepted password for (?P<user>\S+) from (?P<ip>\S+) port \d+"
 )
 
-# Matches lines like:
-# Sep 23 20:50:05 hostname sshd[43]: Connection from 172.18.0.2 port 38288 on 172.18.0.3 port 22 rdomain ""
 CONNECTION_FROM_RE = re.compile(
     r"^(?P<timestamp>\w+ +\d+ \d+:\d+:\d+) (?P<host>\S+) sshd\[(?P<pid>\d+)\]: "
     r"Connection from (?P<ip>\S+) port \d+ on \S+ port \d+"
 )
 
-# Matches lines like:
-# Sep 23 20:50:05 hostname sshd[43]: error: kex_exchange_identification: Connection closed by remote host
 RECON_PROBE_RE = re.compile(
     r"^(?P<timestamp>\w+ +\d+ \d+:\d+:\d+) (?P<host>\S+) sshd\[(?P<pid>\d+)\]: "
     r"error: kex_exchange_identification: Connection closed by remote host"
@@ -44,8 +42,8 @@ RECON_PROBE_RE = re.compile(
 pid_to_ip = {}
 
 
-def parse_line(line):
-    """Try to match a log line against known patterns. Returns a dict or None."""
+def parse_ssh_line(line):
+    """Try to match an auth.log line against known SSH patterns. Returns a dict or None."""
     match = FAILED_LOGIN_RE.match(line)
     if match:
         return {
@@ -53,7 +51,7 @@ def parse_line(line):
             "username": match.group("user"),
             "source_ip": match.group("ip"),
             "source_host": match.group("host"),
-            "timestamp_str": match.group("timestamp"),
+            "event_time": parse_syslog_timestamp(match.group("timestamp")),
         }
 
     match = ACCEPTED_LOGIN_RE.match(line)
@@ -63,12 +61,11 @@ def parse_line(line):
             "username": match.group("user"),
             "source_ip": match.group("ip"),
             "source_host": match.group("host"),
-            "timestamp_str": match.group("timestamp"),
+            "event_time": parse_syslog_timestamp(match.group("timestamp")),
         }
 
     match = CONNECTION_FROM_RE.match(line)
     if match:
-        # Remember this PID's source IP for later correlation; not an event on its own.
         pid_to_ip[match.group("pid")] = match.group("ip")
         return None
 
@@ -81,18 +78,69 @@ def parse_line(line):
             "username": None,
             "source_ip": source_ip,
             "source_host": match.group("host"),
-            "timestamp_str": match.group("timestamp"),
+            "event_time": parse_syslog_timestamp(match.group("timestamp")),
         }
 
     return None
 
 
-def parse_timestamp(timestamp_str):
+def parse_syslog_timestamp(timestamp_str):
     """Syslog timestamps have no year, so we assume the current year."""
     current_year = datetime.now().year
     dt = datetime.strptime(f"{current_year} {timestamp_str}", "%Y %b %d %H:%M:%S")
     return dt.replace(tzinfo=timezone.utc)
 
+
+# ---------------------------------------------------------------------------
+# HTTP log parsing (nginx access.log)
+# ---------------------------------------------------------------------------
+
+HTTP_LOG_RE = re.compile(
+    r'^(?P<ip>\S+) \S+ \S+ \[(?P<timestamp>[^\]]+)\] '
+    r'"(?P<method>\S+) (?P<path>\S+) HTTP/[^"]+" (?P<status>\d+) \d+'
+)
+
+# Known malicious/reconnaissance patterns commonly seen in web attack request paths.
+# This is a simple signature list, similar in spirit to a basic WAF ruleset.
+SUSPICIOUS_PATTERNS = [
+    "union select", "select * from", "' or '1'='1", "or 1=1", "drop table",
+    "<script", "../", "..%2f", "/etc/passwd", ".env", "wp-login", "wp-admin",
+    ".git/config", "phpmyadmin", "eval(", "base64_decode",
+]
+
+
+def is_suspicious_path(path):
+    decoded = unquote(path).lower()
+    return any(pattern in decoded for pattern in SUSPICIOUS_PATTERNS)
+
+
+def parse_http_line(line):
+    """Try to match an access.log line and flag suspicious request paths."""
+    match = HTTP_LOG_RE.match(line)
+    if not match:
+        return None
+
+    path = match.group("path")
+    if not is_suspicious_path(path):
+        return None
+
+    return {
+        "event_type": "http_suspicious_request",
+        "username": None,
+        "source_ip": match.group("ip"),
+        "source_host": "web-target",
+        "event_time": parse_nginx_timestamp(match.group("timestamp")),
+    }
+
+
+def parse_nginx_timestamp(timestamp_str):
+    """nginx timestamps include their own timezone offset, e.g. 23/Sep/2026:22:52:16 +0000."""
+    return datetime.strptime(timestamp_str, "%d/%b/%Y:%H:%M:%S %z")
+
+
+# ---------------------------------------------------------------------------
+# Shared insert + tail logic
+# ---------------------------------------------------------------------------
 
 def insert_event(conn, parsed, raw_line):
     with conn.cursor() as cur:
@@ -107,14 +155,17 @@ def insert_event(conn, parsed, raw_line):
                 parsed["event_type"],
                 parsed["username"],
                 raw_line.strip(),
-                parse_timestamp(parsed["timestamp_str"]),
+                parsed["event_time"],
             ),
         )
     conn.commit()
 
 
-def tail_log(filepath, conn):
-    """Follow a log file like `tail -f`, parsing and inserting new lines as they appear."""
+def tail_log(filepath, parse_fn, label):
+    """Follow a log file like `tail -f`, parsing and inserting new lines as they appear.
+    Runs with its own DB connection, so it can safely run in its own thread."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    print(f"[{label}] Connected to database. Watching {filepath} ...")
     with open(filepath, "r") as f:
         f.seek(0, 2)  # jump to end of file, we only care about new lines
         while True:
@@ -123,13 +174,27 @@ def tail_log(filepath, conn):
                 time.sleep(0.5)
                 continue
 
-            parsed = parse_line(line)
+            parsed = parse_fn(line)
             if parsed:
                 insert_event(conn, parsed, line)
-                print(f"Inserted: {parsed['event_type']} - {parsed['username']} from {parsed['source_ip']}")
+                print(f"[{label}] Inserted: {parsed['event_type']} - {parsed['source_ip']}")
 
 
 if __name__ == "__main__":
-    conn = psycopg2.connect(**DB_CONFIG)
-    print("Connected to database. Watching log file...")
-    tail_log("../logs/ssh-target/auth.log", conn)
+    ssh_thread = threading.Thread(
+        target=tail_log,
+        args=("../logs/ssh-target/auth.log", parse_ssh_line, "ssh"),
+        daemon=True,
+    )
+    http_thread = threading.Thread(
+        target=tail_log,
+        args=("../logs/web-target/access.log", parse_http_line, "http"),
+        daemon=True,
+    )
+
+    ssh_thread.start()
+    http_thread.start()
+
+    # Keep the main thread alive while the two workers run in the background
+    ssh_thread.join()
+    http_thread.join()

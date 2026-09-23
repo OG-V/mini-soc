@@ -10,8 +10,9 @@ RUN useradd -m -s /bin/bash testuser && \
 
 # Allow password authentication
 RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
-    sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
-
+    sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config && \
+    sed -i 's/#LogLevel INFO/LogLevel VERBOSE/' /etc/ssh/sshd_config
+		
 EXPOSE 22
 
 # Start rsyslog (so sshd's syslog messages land in /var/log/auth.log), then sshd in the foreground
