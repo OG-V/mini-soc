@@ -9,19 +9,26 @@ function AlertsList({ onSelectAlert }) {
   const [error, setError] = useState(null)
 
   useEffect(() => {
-    fetch(`${API_BASE}/alerts`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`API returned ${res.status}`)
-        return res.json()
-      })
-      .then((data) => {
-        setAlerts(data)
-        setLoading(false)
-      })
-      .catch((err) => {
-        setError(err.message)
-        setLoading(false)
-      })
+    const fetchAlerts = () => {
+      fetch(`${API_BASE}/alerts`)
+        .then((res) => {
+          if (!res.ok) throw new Error(`API returned ${res.status}`)
+          return res.json()
+        })
+        .then((data) => {
+          setAlerts(data)
+          setLoading(false)
+        })
+        .catch((err) => {
+          setError(err.message)
+          setLoading(false)
+        })
+    }
+
+    fetchAlerts() // initial load
+    const intervalId = setInterval(fetchAlerts, 5000) // then poll every 5s
+
+    return () => clearInterval(intervalId) // cleanup when component unmounts
   }, [])
 
   if (loading) return <p>Loading alerts...</p>
