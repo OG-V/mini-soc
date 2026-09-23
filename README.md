@@ -17,10 +17,11 @@ detects the resulting malicious activity through a real log collection → detec
 - ✅ Phase 5 — Additional attack scenarios: SSH reconnaissance/banner-grab detection, and a web
   target with signature-based detection of suspicious HTTP requests (SQLi, path traversal,
   sensitive-file probing)
+- ✅ Phase 6 — Live dashboard auto-refresh (polls the API every 5s, no manual refresh needed)
 
 **Next up:**
-- ⬜ Phase 6+ — Event correlation across multiple attack stages, live dashboard auto-refresh,
-  privilege escalation / file-change scenarios, packet-level scan detection, full test coverage
+- ⬜ Phase 7+ — Event correlation across multiple attack stages, privilege escalation / file-change
+  scenarios, packet-level scan detection, full test coverage, one-command demo script
 
 ## Detection rules
 
@@ -67,7 +68,7 @@ detects the resulting malicious activity through a real log collection → detec
           │          GET /alerts, /alerts/{id}, /events
           ▼
    [dashboard/]  — React (Vite) frontend
-                  alert list + click-through incident timeline
+                  polls /alerts every 5s; alert list + click-through incident timeline
 ```
 
 ## Components
@@ -81,7 +82,7 @@ detects the resulting malicious activity through a real log collection → detec
 | `log-collector/parser.py` | Python, psycopg2, threading | Tails auth.log and access.log concurrently, parses and normalizes log lines into the `events` table |
 | `detection-engine/detector.py` | Python, psycopg2 | Polls `events`, applies detection rules, writes `alerts` |
 | `api/main.py` | Python, FastAPI, uvicorn | REST API exposing alerts, alert detail with linked events, and raw events |
-| `dashboard/` | React, Vite | Web UI — alert list and incident timeline showing raw evidence per alert |
+| `dashboard/` | React, Vite | Web UI — live-polling alert list and incident timeline showing raw evidence per alert |
 
 ## Running it locally
 
@@ -132,11 +133,10 @@ curl "http://web-target/.env"
 curl "http://web-target/wp-login.php"
 ```
 
-Within a few seconds, the detection engine should print a matching `ALERT: ...` line, and a
-corresponding row will appear in the `alerts` table — visible live in the dashboard at
-`http://localhost:5173`, retrievable via `curl http://localhost:8000/alerts`, or browsed via the
-auto-generated API docs at `http://localhost:8000/docs`. Click an alert in the dashboard to see its
-full incident timeline — the exact raw log lines that triggered it.
+With the dashboard open at `http://localhost:5173`, alerts appear automatically within a few seconds
+of an attack — no manual refresh needed. Click an alert to see its full incident timeline: the exact
+raw log lines that triggered it. Alerts are also retrievable via `curl http://localhost:8000/alerts`,
+or browsed via the auto-generated API docs at `http://localhost:8000/docs`.
 
 ## Design notes
 
@@ -146,6 +146,8 @@ full incident timeline — the exact raw log lines that triggered it.
   so the Python log collector can tail them like a real external log shipper would.
 - **Detection runs on a polling loop**, decoupled from ingestion — closer to how real detection
   engines/SIEMs operate as independent scheduled jobs rather than being triggered inline by ingestion.
+  The dashboard itself also polls the API on the same principle, rather than requiring a manual
+  refresh or a more complex push mechanism (e.g. WebSockets), which wasn't justified for this scale.
 - **Deduplication** is handled via an `alerted` boolean flag directly on each event row. When an
   alert is created, every event that contributed to it is marked `alerted = TRUE` in the same
   transaction as the alert insert, so events are never double-counted across overlapping detection
@@ -173,12 +175,16 @@ full incident timeline — the exact raw log lines that triggered it.
 - **The log collector runs one thread per log source**, each with its own PostgreSQL connection
   (connections are not safe to share across threads), so adding a new log source in the future
   means adding a new parse function and a new thread — the collector doesn't need to be rearchitected.
+- **The attacker's password wordlist is baked into its Docker image** (via a `RUN printf` step in
+  its Dockerfile) rather than created manually in a running container — an earlier version created
+  it by hand, which silently disappeared every time the image was rebuilt, breaking the brute-force
+  scenario until the file was recreated. Baking it into the image makes the attacker container fully
+  reproducible from a clean build, with no manual setup steps.
 
 ## Roadmap
 
 - Event correlation: linking related alerts across attack stages (e.g. a recon scan followed by a
   brute-force attempt from the same IP) into a single incident narrative
-- Live auto-refresh in the dashboard, rather than requiring a manual page refresh
 - Privilege escalation and file-integrity monitoring scenarios
 - Packet-level scan detection (raw SYN scans), likely via a lightweight `tcpdump`/`tshark` capture
   and threshold-based SYN/FIN counting, as a more complete alternative to the SSH-log-based approach
