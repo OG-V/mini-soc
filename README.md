@@ -13,10 +13,11 @@ detects the resulting malicious activity through a real log collection → detec
 - ✅ Phase 1 — Log collection & normalization (Python → PostgreSQL)
 - ✅ Phase 2 — Detection engine (SSH brute-force rule, MITRE ATT&CK tagging)
 - ✅ Phase 3 — REST API (FastAPI) exposing alerts, alert detail with evidence trail, and raw events
+- ✅ Phase 4 — Dashboard (React) — alert list, click-through incident timeline showing raw evidence
 
 **Next up:**
-- ⬜ Phase 4 — Dashboard (React) for browsing alerts and incident timelines
-- ⬜ Phase 5+ — Additional attack scenarios, event correlation, incident view, full documentation
+- ⬜ Phase 5+ — Additional attack scenarios (port scanning, HTTP attacks), event correlation,
+  live auto-refresh, full documentation
 
 ## Architecture (current)
 
@@ -45,7 +46,8 @@ detects the resulting malicious activity through a real log collection → detec
 [api/main.py]  — FastAPI REST API
         │          GET /alerts, /alerts/{id}, /events
         ▼
-(future: React dashboard)
+[dashboard/]  — React (Vite) frontend
+               alert list + click-through incident timeline
 ```
 
 ## Components
@@ -58,6 +60,7 @@ detects the resulting malicious activity through a real log collection → detec
 | `log-collector/parser.py` | Python, psycopg2 | Tails auth.log, parses and normalizes SSH log lines into the `events` table |
 | `detection-engine/detector.py` | Python, psycopg2 | Polls `events`, applies detection rules, writes `alerts` |
 | `api/main.py` | Python, FastAPI, uvicorn | REST API exposing alerts, alert detail with linked events, and raw events |
+| `dashboard/` | React, Vite | Web UI — alert list and incident timeline showing raw evidence per alert |
 
 ## Running it locally
 
@@ -80,6 +83,10 @@ cd detection-engine && source venv/bin/activate && python3 detector.py
 
 # Terminal 3 — API
 cd api && source venv/bin/activate && uvicorn main:app --reload --port 8000
+
+
+# Terminal 4 — dashboard
+cd dashboard && npm run dev
 ```
 
 To trigger a brute-force attack scenario:
@@ -90,8 +97,10 @@ hydra -l testuser -P /attacks/passwords.txt ssh://ssh-target
 ```
 
 Within a few seconds, the detection engine should print an `ALERT: ssh_brute_force` line, and a
-corresponding row will appear in the `alerts` table — retrievable via `curl http://localhost:8000/alerts`,
-or browse the auto-generated API docs at `http://localhost:8000/docs`.
+corresponding row will appear in the `alerts` table — visible live in the dashboard at
+`http://localhost:5173`, retrievable via `curl http://localhost:8000/alerts`, or browsed via the
+auto-generated API docs at `http://localhost:8000/docs`. Click an alert in the dashboard to see its
+full incident timeline — the exact raw log lines that triggered it.
 
 ## Design notes
 
