@@ -1,3 +1,6 @@
 log-collector/venv/
 logs/
 detection-engine/venv/
+api/venv/
+**/__pycache__/
+*.pyc
