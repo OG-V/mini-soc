@@ -165,6 +165,39 @@ def parse_tcpdump_timestamp(timestamp_str):
     return dt.replace(tzinfo=timezone.utc)
 
 # ---------------------------------------------------------------------------
+# File integrity monitoring parsing (fim-watch.sh capture on ssh-target)
+# ---------------------------------------------------------------------------
+
+# Matches a fim-watch.sh line reporting that a watched file's hash changed.
+# There's no source IP here at all - a content-hash diff has no visibility
+# into which SSH session (if any) caused the change; that would require
+# process-level auditing (auditd/eBPF), which is out of scope for this rule.
+FIM_RE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) FILE_CHANGED "
+    r"(?P<path>\S+) (?P<old_hash>\S+) (?P<new_hash>\S+)"
+)
+
+def parse_fim_line(line):
+    """Try to match a fim-watch.sh line. Returns a dict or None."""
+    match = FIM_RE.match(line)
+    if not match:
+        return None
+
+    return {
+        "event_type": "file_integrity_violation",
+        "username": None,
+        "source_ip": None,
+        "source_host": "ssh-target",
+        "event_time": parse_fim_timestamp(match.group("timestamp")),
+        "file_path": match.group("path"),
+    }
+
+def parse_fim_timestamp(timestamp_str):
+    """fim-watch.sh emits ISO 8601 UTC timestamps, e.g. 2026-09-24T15:01:56Z."""
+    dt = datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%SZ")
+    return dt.replace(tzinfo=timezone.utc)
+
+# ---------------------------------------------------------------------------
 # Shared insert + tail logic
 # ---------------------------------------------------------------------------
 
@@ -172,8 +205,8 @@ def insert_event(conn, parsed, raw_line):
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO events (source_host, source_ip, event_type, username, raw_log, event_time, dest_port)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO events (source_host, source_ip, event_type, username, raw_log, event_time, dest_port, file_path)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 parsed["source_host"],
@@ -183,6 +216,7 @@ def insert_event(conn, parsed, raw_line):
                 raw_line.strip(),
                 parsed["event_time"],
                 parsed.get("dest_port"),
+                parsed.get("file_path"),
             ),
         )
     conn.commit()
@@ -221,12 +255,19 @@ if __name__ == "__main__":
         args=("../logs/ssh-target/tcpdump-syn.log", parse_synscan_line, "synscan"),
         daemon=True,
     )
+    fim_thread = threading.Thread(
+        target=tail_log,
+        args=("../logs/ssh-target/fim.log", parse_fim_line, "fim"),
+        daemon=True,
+    )
 
     ssh_thread.start()
     http_thread.start()
     synscan_thread.start()
+    fim_thread.start()
 
-    # Keep the main thread alive while the three workers run in the background
+    # Keep the main thread alive while the four workers run in the background
     ssh_thread.join()
     http_thread.join()
     synscan_thread.join()
+    fim_thread.join()

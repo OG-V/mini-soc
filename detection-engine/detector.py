@@ -25,6 +25,17 @@ PORT_SCAN_WINDOW_SECONDS = 10
 # into a single incident, regardless of which rule(s) fired.
 CORRELATION_WINDOW_SECONDS = 600
 
+# Which MITRE technique a file-integrity violation maps to depends on *which*
+# file changed - tampering with authorized_keys, /etc/passwd, and /etc/sudoers
+# are meaningfully different techniques, not just "a file changed somewhere."
+FIM_MITRE_MAP = {
+    "/etc/passwd": "T1136.001",                  # Create Account: Local Account
+    "/etc/shadow": "T1003.008",                  # OS Credential Dumping: /etc/passwd and /etc/shadow
+    "/etc/sudoers": "T1548.003",                 # Abuse Elevation Control Mechanism: Sudo and Sudo Caching
+    "/root/.ssh/authorized_keys": "T1098.004",   # Account Manipulation: SSH Authorized Keys
+}
+FIM_DEFAULT_MITRE = "T1565"  # Data Manipulation - fallback for any watched file not in the map above
+
 def find_brute_force_candidates(conn):
     """
     Groups recent, not-yet-alerted ssh_failed_login events by source_ip,
@@ -209,6 +220,54 @@ def create_port_scan_alert(conn, source_ip, port_count, first_id, last_id, event
     conn.commit()
     return alert_id
 
+def find_fim_candidates(conn):
+    """
+    Every not-yet-alerted file_integrity_violation event is significant on
+    its own - unlike the threshold-based network rules above, a single
+    unauthorized change to a security-critical file warrants an immediate
+    alert, not a count crossing some threshold.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, file_path
+            FROM events
+            WHERE event_type = 'file_integrity_violation'
+              AND alerted = FALSE
+            ORDER BY id
+            """
+        )
+        return cur.fetchall()
+
+def create_fim_alert(conn, event_id, file_path):
+    mitre_technique = FIM_MITRE_MAP.get(file_path, FIM_DEFAULT_MITRE)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO alerts (rule_name, mitre_technique, source_ip, username,
+                                 description, first_event_id, last_event_id, event_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                "file_integrity_violation",
+                mitre_technique,
+                None,
+                None,
+                f"Unauthorized modification detected: {file_path}",
+                event_id,
+                event_id,
+                1,
+            ),
+        )
+        alert_id = cur.fetchone()[0]
+        cur.execute(
+            "UPDATE events SET alerted = TRUE WHERE id = %s",
+            (event_id,),
+        )
+    conn.commit()
+    return alert_id, mitre_technique
+
 def create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, username):
     with conn.cursor() as cur:
         cur.execute(
@@ -294,7 +353,7 @@ def correlate_alert(conn, alert_id, source_ip, mitre_technique):
 def run():
     conn = psycopg2.connect(**DB_CONFIG)
     conn.autocommit = True
-    print("Detection engine started. Polling for brute-force, recon, web attack, and port scan patterns, correlating into incidents...")
+    print("Detection engine started. Polling for brute-force, recon, web attack, port scan, and file integrity violations, correlating into incidents...")
     while True:
         candidates = find_brute_force_candidates(conn)
         for source_ip, failure_count, first_id, last_id, event_ids, usernames in candidates:
@@ -320,6 +379,15 @@ def run():
             alert_id = create_port_scan_alert(conn, source_ip, port_count, first_id, last_id, event_ids)
             correlate_alert(conn, alert_id, source_ip, "T1046")
             print(f"ALERT: port_scan_detected from {source_ip} ({port_count} ports)")
+
+        fim_candidates = find_fim_candidates(conn)
+        for event_id, file_path in fim_candidates:
+            alert_id, mitre_technique = create_fim_alert(conn, event_id, file_path)
+            # No source_ip is available for a file-integrity violation (a
+            # content-hash diff has no visibility into which SSH session, if
+            # any, caused it), so it can't be correlated by IP like the other
+            # rules - it stands alone as its own incident-less alert.
+            print(f"ALERT: file_integrity_violation - {file_path} ({mitre_technique})")
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
