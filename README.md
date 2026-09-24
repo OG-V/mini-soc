@@ -4,7 +4,7 @@ A small but functioning Security Operations Center (SOC) pipeline, built as a po
 demonstrate practical skills in detection engineering, backend development, and system design.
 
 The system simulates a small organization's infrastructure, runs controlled attacks against it, and
-detects the resulting malicious activity through a real log collection → detection → alerting →
+detects the resulting malicious activity through a real log/packet collection → detection → alerting →
 correlation pipeline.
 
 ## Status
@@ -23,10 +23,13 @@ correlation pipeline.
   grouped into a single incident (e.g. a recon scan followed by a brute-force attempt from the same
   attacker), exposed via the API and a dedicated Incidents view in the dashboard, cross-linked with
   alerts in both directions
+- ✅ Phase 8 — Packet-level scan detection: `ssh-target` runs `tcpdump` to capture raw inbound SYN
+  packets, closing the gap where a bare TCP port scan (one that never speaks SSH) leaves no trace
+  in `auth.log`. Flows through the same collection → detection → correlation pipeline as every
+  other rule.
 
 **Next up:**
 - ⬜ Privilege escalation / file-change detection scenarios
-- ⬜ Packet-level scan detection (raw SYN scans)
 - ⬜ Full automated test coverage
 - ⬜ One-command demo script
 
@@ -37,6 +40,7 @@ correlation pipeline.
 | `ssh_brute_force` | 4+ failed SSH logins from one IP within 60s | T1110 — Brute Force | `ssh-target` auth.log |
 | `ssh_recon_scan` | 2+ SSH banner-grab/recon probes from one IP within 60s | T1595 — Active Scanning | `ssh-target` auth.log |
 | `web_attack_probing` | 3+ suspicious HTTP requests from one IP within 60s | T1190 — Exploit Public-Facing Application | `web-target` access.log |
+| `port_scan_detected` | 5+ distinct destination ports probed by one IP within 10s | T1046 — Network Service Scanning | `ssh-target` raw packet capture (`tcpdump`) |
 
 Alerts fired by any of the above are further correlated: any two alerts from the same source IP
 within a 10-minute window are grouped into one **incident**, regardless of which rule(s) fired.
@@ -46,12 +50,13 @@ within a 10-minute window are grouped into one **incident**, regardless of which
 ```
 [Attacker container: Kali + Hydra + nmap + curl]
         │
-        ├─ SSH brute-force / recon ──────────┐
-        │                                     ▼
-        │                     [ssh-target: Ubuntu + sshd + rsyslog]
-        │                                     │ writes /var/log/auth.log
-        │                                     ▼
-        │                          [Host-mounted log volume]
+        ├─ SSH brute-force / recon / port scan ──┐
+        │                                         ▼
+        │                     [ssh-target: Ubuntu + sshd + rsyslog + tcpdump]
+        │                                         │ writes /var/log/auth.log
+        │                                         │ writes /var/log/tcpdump-syn.log
+        │                                         ▼
+        │                              [Host-mounted log volume]
         │
         └─ Suspicious HTTP requests ─────────┐
                                               ▼
@@ -61,7 +66,8 @@ within a 10-minute window are grouped into one **incident**, regardless of which
                                    [Host-mounted log volume]
                                               │
                                               ▼
-                         [log-collector/parser.py]  — one thread per log source,
+                         [log-collector/parser.py]  — one thread per source (auth.log,
+                         │                             access.log, tcpdump-syn.log),
                          │                             each with its own DB connection;
                          │                             parses lines, normalizes into events
                          ▼
@@ -69,7 +75,7 @@ within a 10-minute window are grouped into one **incident**, regardless of which
                          │
                          ▼
           [detection-engine/detector.py]  — polls events every 5s,
-          │                                  applies 3 threshold-based rules,
+          │                                  applies 4 threshold-based rules,
           │                                  then correlates new alerts into incidents
           │                                  by source IP + time window
           ▼
@@ -88,11 +94,11 @@ within a 10-minute window are grouped into one **incident**, regardless of which
 
 | Component | Tech | Purpose |
 |---|---|---|
-| `ssh-target` | Docker, Ubuntu, OpenSSH, rsyslog | Simulated vulnerable Linux server |
+| `ssh-target` | Docker, Ubuntu, OpenSSH, rsyslog, tcpdump | Simulated vulnerable Linux server; also captures raw inbound SYN packets to catch scans that never speak SSH |
 | `web-target` | Docker, nginx | Simulated web server; access log used for signature-based attack detection |
 | `attacker` | Docker, Kali Linux, Hydra, nmap, curl | Controlled attack execution |
 | `postgres` | PostgreSQL 16 | Stores structured events, alerts, and incidents |
-| `log-collector/parser.py` | Python, psycopg2, threading | Tails auth.log and access.log concurrently, parses and normalizes log lines into the `events` table |
+| `log-collector/parser.py` | Python, psycopg2, threading | Tails auth.log, access.log, and the tcpdump SYN capture concurrently, parses and normalizes lines into the `events` table |
 | `detection-engine/detector.py` | Python, psycopg2 | Polls `events`, applies detection rules, writes `alerts`, and correlates new alerts into `incidents` by source IP + time window |
 | `api/main.py` | Python, FastAPI, uvicorn | REST API exposing alerts, alert detail with linked events, incidents, incident detail with linked alerts, and raw events |
 | `dashboard/` | React, Vite | Web UI — live-polling Alerts and Incidents tabs, cross-linked, with click-through incident timeline showing raw evidence per alert |
@@ -110,7 +116,7 @@ This starts the SSH target, web target, attacker container, and PostgreSQL.
 Then, in separate terminals (each with its own venv):
 
 ```bash
-# Terminal 1 — log collector (watches both auth.log and access.log)
+# Terminal 1 — log collector (watches auth.log, access.log, and the tcpdump SYN capture)
 cd log-collector && source venv/bin/activate && python3 parser.py
 
 # Terminal 2 — detection engine
@@ -144,6 +150,12 @@ docker exec -it attacker bash
 curl "http://web-target/index.html?id=1%27%20OR%20%271%27%3D%271"
 curl "http://web-target/.env"
 curl "http://web-target/wp-login.php"
+```
+
+**Raw TCP port scan (never speaks SSH, invisible to auth.log, caught by packet capture instead):**
+```bash
+docker exec -it attacker bash
+nmap -sT -p 20-25 ssh-target
 ```
 
 **Correlated incident (recon followed by brute force from the same attacker):**
@@ -192,17 +204,26 @@ or browsed via the auto-generated API docs at `http://localhost:8000/docs`.
   known list of malicious patterns (SQL injection fragments, path traversal, sensitive file paths).
   This is deliberately simple — closer to a basic WAF ruleset than a general-purpose anomaly
   detector — and is explainable end-to-end, which was prioritized over sophistication for v1.
-- **Raw TCP port scans are not detectable from `sshd`'s own logs**, even at maximum log verbosity —
-  `sshd` only logs a connection once a client begins the SSH protocol handshake, so a bare
-  `nmap -sT`/`-sS` scan that never speaks SSH leaves no trace in `auth.log`. This is a genuine,
-  documented limitation of host-based application logging, not a gap in this project's detection
-  logic — real SOCs address it with network-level telemetry (firewall/flow logs, an IDS such as
-  Suricata) rather than relying on application logs alone. What this project detects instead is
-  the SSH-level *banner-grab*, a lighter-weight but very common reconnaissance action that does
-  reach the SSH protocol layer and therefore does get logged.
-- **The log collector runs one thread per log source**, each with its own PostgreSQL connection
-  (connections are not safe to share across threads), so adding a new log source in the future
-  means adding a new parse function and a new thread — the collector doesn't need to be rearchitected.
+- **Raw TCP port scans required moving past log analysis entirely.** `sshd` only logs a connection
+  once a client begins the SSH protocol handshake, so a bare `nmap -sT`/`-sS` scan that never
+  speaks SSH leaves zero trace in `auth.log` — a genuine limitation of host-based application
+  logging, not a gap in earlier detection logic. The fix is `tcpdump` running inside `ssh-target`
+  itself (given `NET_RAW`/`NET_ADMIN`, which containers don't have by default), capturing every
+  inbound SYN packet — including ones for ports nothing is listening on — to a log file the
+  existing collector tails exactly like any other source. The rule counts **distinct destination
+  ports** touched by an IP, not raw event count, since breadth-across-ports is a scan's actual
+  signature, not repetition.
+- **A real production bug surfaced while building the port-scan rule**: `detector.py`'s read-only
+  `find_*_candidates()` queries never committed. Under psycopg2's default (non-autocommit) mode,
+  even a plain `SELECT` holds its table lock for the life of the transaction, and a transaction
+  only ends on an explicit commit. Since most poll cycles find no candidates and never reach a
+  `create_*_alert()` call (the only place that *did* commit), the connection could sit idle in an
+  open transaction indefinitely — which eventually blocked an unrelated `ALTER TABLE` migration,
+  and every insert or query queued up behind it. Fixed by putting the connection in autocommit
+  mode. A useful, real-world reminder that "read-only" doesn't mean "no cleanup needed."
+- **The log collector runs one thread per source**, each with its own PostgreSQL connection
+  (connections are not safe to share across threads), so adding a new source means adding a new
+  parse function and a new thread — the collector doesn't need to be rearchitected.
 - **The attacker's password wordlist is baked into its Docker image** (via a `RUN printf` step in
   its Dockerfile) rather than created manually in a running container — an earlier version created
   it by hand, which silently disappeared every time the image was rebuilt, breaking the brute-force
@@ -212,6 +233,4 @@ or browsed via the auto-generated API docs at `http://localhost:8000/docs`.
 ## Roadmap
 
 - Privilege escalation and file-integrity monitoring scenarios
-- Packet-level scan detection (raw SYN scans), likely via a lightweight `tcpdump`/`tshark` capture
-  and threshold-based SYN/FIN counting, as a more complete alternative to the SSH-log-based approach
 - Expanded automated test coverage and a one-command `./attack.sh` demo script
