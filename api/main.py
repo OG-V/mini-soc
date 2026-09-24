@@ -33,7 +33,7 @@ def list_alerts():
         cur.execute(
             """
             SELECT id, rule_name, mitre_technique, source_ip, username,
-                   description, event_count, created_at
+                   description, event_count, created_at, incident_id
             FROM alerts
             ORDER BY created_at DESC
             """
@@ -69,6 +69,54 @@ def get_alert(alert_id: int):
     conn.close()
     alert["events"] = events
     return alert
+
+
+@app.get("/incidents")
+def list_incidents():
+    """Return all incidents, most recently active first."""
+    conn = get_connection()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, source_ip, alert_count, mitre_techniques, status,
+                   first_seen, last_seen
+            FROM incidents
+            ORDER BY last_seen DESC
+            """
+        )
+        rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+@app.get("/incidents/{incident_id}")
+def get_incident(incident_id: int):
+    """Return one incident plus every alert correlated into it."""
+    conn = get_connection()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM incidents WHERE id = %s", (incident_id,))
+        incident = cur.fetchone()
+
+        if incident is None:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Incident not found")
+
+        cur.execute(
+            """
+            SELECT id, rule_name, mitre_technique, source_ip, username,
+                   description, event_count, created_at
+            FROM alerts
+            WHERE incident_id = %s
+            ORDER BY created_at
+            """,
+            (incident_id,),
+        )
+        alerts = cur.fetchall()
+
+    conn.close()
+    incident["alerts"] = alerts
+    return incident
+
 
 @app.get("/events")
 def list_events(limit: int = 50):
