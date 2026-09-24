@@ -1,5 +1,7 @@
 # Mini SOC — Security Monitoring & Detection Lab
 
+![Mini SOC demo](demo.gif)
+
 A Security Operations Center (SOC) pipeline, built as a portfolio project.
 
 The system simulates a small organization's infrastructure, runs controlled attacks against it, and
