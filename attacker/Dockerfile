@@ -1,7 +1,7 @@
 FROM kalilinux/kali-rolling
 
 RUN apt-get update && \
-    apt-get install -y hydra nmap openssh-client curl && \
+    apt-get install -y hydra nmap openssh-client curl sshpass && \
     apt-get clean
 
 WORKDIR /attacks
