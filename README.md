@@ -4,8 +4,8 @@ A small but functioning Security Operations Center (SOC) pipeline, built as a po
 demonstrate practical skills in detection engineering, backend development, and system design.
 
 The system simulates a small organization's infrastructure, runs controlled attacks against it, and
-detects the resulting malicious activity through a real log/packet collection → detection → alerting →
-correlation pipeline.
+detects the resulting malicious activity through a real log/packet/file-integrity collection →
+detection → alerting → correlation pipeline.
 
 ## Status
 
@@ -27,9 +27,12 @@ correlation pipeline.
   packets, closing the gap where a bare TCP port scan (one that never speaks SSH) leaves no trace
   in `auth.log`. Flows through the same collection → detection → correlation pipeline as every
   other rule.
+- ✅ Phase 9 — Privilege escalation scenario and file-integrity monitoring: `ssh-target` ships a
+  deliberate passwordless-sudo misconfiguration, and a background watcher hashes a set of
+  security-critical files, flagging any unauthorized change (e.g. an attacker planting a backdoor
+  key in `root`'s `authorized_keys`) and mapping it to the specific MITRE technique for that file.
 
 **Next up:**
-- ⬜ Privilege escalation / file-change detection scenarios
 - ⬜ Full automated test coverage
 - ⬜ One-command demo script
 
@@ -41,22 +44,26 @@ correlation pipeline.
 | `ssh_recon_scan` | 2+ SSH banner-grab/recon probes from one IP within 60s | T1595 — Active Scanning | `ssh-target` auth.log |
 | `web_attack_probing` | 3+ suspicious HTTP requests from one IP within 60s | T1190 — Exploit Public-Facing Application | `web-target` access.log |
 | `port_scan_detected` | 5+ distinct destination ports probed by one IP within 10s | T1046 — Network Service Scanning | `ssh-target` raw packet capture (`tcpdump`) |
+| `file_integrity_violation` | Any hash change to a watched file | Varies by file — e.g. T1098.004 for `authorized_keys`, T1136.001 for `/etc/passwd`, T1548.003 for `/etc/sudoers` | `ssh-target` file hash watcher (`fim-watch.sh`) |
 
-Alerts fired by any of the above are further correlated: any two alerts from the same source IP
-within a 10-minute window are grouped into one **incident**, regardless of which rule(s) fired.
+Alerts with a source IP are further correlated: any two such alerts from the same IP within a
+10-minute window are grouped into one **incident**, regardless of which rule(s) fired.
+`file_integrity_violation` alerts have no source IP (see Design notes) and don't currently
+participate in correlation.
 
 ## Architecture (current)
 
 ```
-[Attacker container: Kali + Hydra + nmap + curl]
+[Attacker container: Kali + Hydra + nmap + curl + openssh-client]
         │
-        ├─ SSH brute-force / recon / port scan ──┐
-        │                                         ▼
-        │                     [ssh-target: Ubuntu + sshd + rsyslog + tcpdump]
-        │                                         │ writes /var/log/auth.log
-        │                                         │ writes /var/log/tcpdump-syn.log
-        │                                         ▼
-        │                              [Host-mounted log volume]
+        ├─ SSH brute-force / recon / port scan / (post-login) priv-esc ──┐
+        │                                                                 ▼
+        │                     [ssh-target: Ubuntu + sshd + rsyslog + tcpdump + fim-watch.sh]
+        │                                                                 │ writes /var/log/auth.log
+        │                                                                 │ writes /var/log/tcpdump-syn.log
+        │                                                                 │ writes /var/log/fim.log
+        │                                                                 ▼
+        │                                                      [Host-mounted log volume]
         │
         └─ Suspicious HTTP requests ─────────┐
                                               ▼
@@ -67,7 +74,7 @@ within a 10-minute window are grouped into one **incident**, regardless of which
                                               │
                                               ▼
                          [log-collector/parser.py]  — one thread per source (auth.log,
-                         │                             access.log, tcpdump-syn.log),
+                         │                             access.log, tcpdump-syn.log, fim.log),
                          │                             each with its own DB connection;
                          │                             parses lines, normalizes into events
                          ▼
@@ -75,9 +82,9 @@ within a 10-minute window are grouped into one **incident**, regardless of which
                          │
                          ▼
           [detection-engine/detector.py]  — polls events every 5s,
-          │                                  applies 4 threshold-based rules,
-          │                                  then correlates new alerts into incidents
-          │                                  by source IP + time window
+          │                                  applies 5 rules (4 threshold-based, 1
+          │                                  fire-on-any-occurrence), then correlates
+          │                                  new IP-attributed alerts into incidents
           ▼
 [PostgreSQL: alerts table] ──┐  [PostgreSQL: incidents table]
           │                  └──────────────┘  (alerts.incident_id links the two)
@@ -94,12 +101,12 @@ within a 10-minute window are grouped into one **incident**, regardless of which
 
 | Component | Tech | Purpose |
 |---|---|---|
-| `ssh-target` | Docker, Ubuntu, OpenSSH, rsyslog, tcpdump | Simulated vulnerable Linux server; also captures raw inbound SYN packets to catch scans that never speak SSH |
+| `ssh-target` | Docker, Ubuntu, OpenSSH, rsyslog, tcpdump, bash | Simulated vulnerable Linux server: SSH auth logging, raw SYN capture (catches scans that never speak SSH), and a background file-integrity watcher over security-critical files. Ships a deliberate passwordless-sudo misconfiguration for the privilege-escalation scenario. |
 | `web-target` | Docker, nginx | Simulated web server; access log used for signature-based attack detection |
-| `attacker` | Docker, Kali Linux, Hydra, nmap, curl | Controlled attack execution |
+| `attacker` | Docker, Kali Linux, Hydra, nmap, curl, openssh-client | Controlled attack execution |
 | `postgres` | PostgreSQL 16 | Stores structured events, alerts, and incidents |
-| `log-collector/parser.py` | Python, psycopg2, threading | Tails auth.log, access.log, and the tcpdump SYN capture concurrently, parses and normalizes lines into the `events` table |
-| `detection-engine/detector.py` | Python, psycopg2 | Polls `events`, applies detection rules, writes `alerts`, and correlates new alerts into `incidents` by source IP + time window |
+| `log-collector/parser.py` | Python, psycopg2, threading | Tails auth.log, access.log, the tcpdump SYN capture, and the file-integrity log concurrently, parses and normalizes lines into the `events` table |
+| `detection-engine/detector.py` | Python, psycopg2 | Polls `events`, applies detection rules, writes `alerts`, and correlates IP-attributed alerts into `incidents` by source IP + time window |
 | `api/main.py` | Python, FastAPI, uvicorn | REST API exposing alerts, alert detail with linked events, incidents, incident detail with linked alerts, and raw events |
 | `dashboard/` | React, Vite | Web UI — live-polling Alerts and Incidents tabs, cross-linked, with click-through incident timeline showing raw evidence per alert |
 
@@ -116,7 +123,7 @@ This starts the SSH target, web target, attacker container, and PostgreSQL.
 Then, in separate terminals (each with its own venv):
 
 ```bash
-# Terminal 1 — log collector (watches auth.log, access.log, and the tcpdump SYN capture)
+# Terminal 1 — log collector (watches auth.log, access.log, tcpdump SYN capture, and fim.log)
 cd log-collector && source venv/bin/activate && python3 parser.py
 
 # Terminal 2 — detection engine
@@ -156,6 +163,17 @@ curl "http://web-target/wp-login.php"
 ```bash
 docker exec -it attacker bash
 nmap -sT -p 20-25 ssh-target
+```
+
+**Privilege escalation + persistence (exploits the passwordless-sudo misconfig, then plants a
+backdoor SSH key — caught by file-integrity monitoring):**
+```bash
+docker exec -it attacker bash
+ssh testuser@ssh-target
+# password: password123
+sudo bash -c 'echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINTRUDER attacker-backdoor" >> /root/.ssh/authorized_keys'
+exit
+exit
 ```
 
 **Correlated incident (recon followed by brute force from the same attacker):**
@@ -221,6 +239,27 @@ or browsed via the auto-generated API docs at `http://localhost:8000/docs`.
   open transaction indefinitely — which eventually blocked an unrelated `ALTER TABLE` migration,
   and every insert or query queued up behind it. Fixed by putting the connection in autocommit
   mode. A useful, real-world reminder that "read-only" doesn't mean "no cleanup needed."
+- **Privilege escalation is modeled via a deliberate misconfiguration** (passwordless `sudo` for
+  the already-brute-forceable `testuser` account), not an exploited CVE — the point is to
+  demonstrate detecting the *outcome* (an unauthorized privileged action), not to build or exploit
+  a real vulnerability.
+- **File-integrity monitoring is content-hash based, not process-based, and that's a real,
+  deliberate limitation, not an oversight.** A background script (`fim-watch.sh`) periodically
+  hashes a small watchlist (`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`,
+  `/root/.ssh/authorized_keys`) and logs any change. This tells you **what** changed and **when**,
+  but not **who** changed it or **how** — a hash diff has no visibility into which process or SSH
+  session was responsible. `file_integrity_violation` alerts therefore carry no source IP and
+  don't participate in incident correlation the way network-based alerts do. Real attribution
+  would require process-level auditing (`auditd` watch rules correlated back to SSH session data
+  via `loginuid`, or an eBPF-based approach) — a meaningfully larger subsystem, considered and
+  deliberately left out of scope for this project rather than attempted and left broken.
+- **Which MITRE technique a violation maps to depends on which file changed**, not a single
+  generic tag — `authorized_keys` tampering (T1098.004) and `/etc/passwd` tampering (T1136.001)
+  are meaningfully different techniques, and the alert reflects that distinction.
+- **Unlike every other rule, file-integrity detection has no threshold or time window** — a single
+  unauthorized change to a security-critical file is inherently significant, unlike e.g. one failed
+  SSH login, which is normal noise. The detection logic reflects that: it fires on any occurrence,
+  not a count crossing some number.
 - **The log collector runs one thread per source**, each with its own PostgreSQL connection
   (connections are not safe to share across threads), so adding a new source means adding a new
   parse function and a new thread — the collector doesn't need to be rearchitected.
@@ -232,5 +271,4 @@ or browsed via the auto-generated API docs at `http://localhost:8000/docs`.
 
 ## Roadmap
 
-- Privilege escalation and file-integrity monitoring scenarios
 - Expanded automated test coverage and a one-command `./attack.sh` demo script
