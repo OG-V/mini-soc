@@ -1,43 +1,28 @@
 # Mini SOC — Security Monitoring & Detection Lab
 
-A small but functioning Security Operations Center (SOC) pipeline, built as a portfolio project to
-demonstrate practical skills in detection engineering, backend development, and system design.
+A Security Operations Center (SOC) pipeline, built as a portfolio project.
 
 The system simulates a small organization's infrastructure, runs controlled attacks against it, and
-detects the resulting malicious activity through a real log/packet/file-integrity collection →
-detection → alerting → correlation pipeline.
+detects the resulting malicious activity through a log/packet/file-integrity collection → detection →
+alerting → correlation pipeline.
 
 ## Status
 
-**Phases completed:**
-- ✅ Phase 0 — Docker lab environment (attacker + target containers)
-- ✅ Phase 1 — Log collection & normalization (Python → PostgreSQL)
-- ✅ Phase 2 — Detection engine (SSH brute-force rule, MITRE ATT&CK tagging)
-- ✅ Phase 3 — REST API (FastAPI) exposing alerts, alert detail with evidence trail, and raw events
-- ✅ Phase 4 — Dashboard (React) — alert list, click-through incident timeline showing raw evidence
-- ✅ Phase 5 — Additional attack scenarios: SSH reconnaissance/banner-grab detection, and a web
-  target with signature-based detection of suspicious HTTP requests (SQLi, path traversal,
-  sensitive-file probing)
-- ✅ Phase 6 — Live dashboard auto-refresh (polls the API every 5s, no manual refresh needed)
-- ✅ Phase 7 — Event correlation: alerts from the same source IP within a rolling time window are
-  grouped into a single incident (e.g. a recon scan followed by a brute-force attempt from the same
-  attacker), exposed via the API and a dedicated Incidents view in the dashboard, cross-linked with
-  alerts in both directions
-- ✅ Phase 8 — Packet-level scan detection: `ssh-target` runs `tcpdump` to capture raw inbound SYN
-  packets, closing the gap where a bare TCP port scan (one that never speaks SSH) leaves no trace
-  in `auth.log`. Flows through the same collection → detection → correlation pipeline as every
-  other rule.
-- ✅ Phase 9 — Privilege escalation scenario and file-integrity monitoring: `ssh-target` ships a
-  deliberate passwordless-sudo misconfiguration, and a background watcher hashes a set of
-  security-critical files, flagging any unauthorized change (e.g. an attacker planting a backdoor
-  key in `root`'s `authorized_keys`) and mapping it to the specific MITRE technique for that file.
-- ✅ Phase 10 — Automated tests for the log-parsing layer, and a one-command `./attack.sh` demo
-  script that fires every attack scenario in sequence against a running lab, producing a full
-  multi-stage incident on the dashboard from a single command.
+Planned roadmap (10 phases) complete. See [Roadmap](#roadmap) for possible future work.
 
-This project's planned roadmap is now complete. Possible future directions: process-level
-attribution for file-integrity violations (see Design notes), additional attack scenarios, and
-broader automated test coverage of the detection/API layers.
+| Phase | Delivered |
+|---|---|
+| 0 | Docker lab environment (attacker + target containers) |
+| 1 | Log collection & normalization (Python → PostgreSQL) |
+| 2 | Detection engine — SSH brute-force rule, MITRE ATT&CK tagging |
+| 3 | REST API (FastAPI) — alerts, alert detail with evidence trail, raw events |
+| 4 | Dashboard (React) — alert list, click-through incident timeline showing raw evidence |
+| 5 | SSH reconnaissance/banner-grab detection; web target with signature-based detection of suspicious HTTP requests (SQLi, path traversal, sensitive-file probing) |
+| 6 | Live dashboard auto-refresh (polls the API every 5s, no manual refresh) |
+| 7 | Event correlation — alerts from the same source IP within a rolling window grouped into one incident, exposed via the API and a dedicated Incidents view, cross-linked with alerts in both directions |
+| 8 | Packet-level scan detection — `ssh-target` runs `tcpdump` to capture raw inbound SYN packets, closing the gap where a bare TCP port scan (one that never speaks SSH) leaves no trace in `auth.log` |
+| 9 | Privilege-escalation scenario + file-integrity monitoring — `ssh-target` ships a deliberate passwordless-sudo misconfiguration; a background watcher hashes security-critical files and maps any unauthorized change to its specific MITRE technique |
+| 10 | Automated tests for the log-parsing layer; one-command `./attack.sh` demo firing every attack scenario in sequence, producing a full multi-stage incident from a single command |
 
 ## Detection rules
 
@@ -313,7 +298,7 @@ or browsed via the auto-generated API docs at `http://localhost:8000/docs`.
 
 ## Roadmap
 
-This project's originally planned roadmap is complete. Possible future directions:
+Planned roadmap complete. Possible future directions:
 
 - Process-level attribution for file-integrity violations (`auditd`/eBPF), to correlate those
   alerts into incidents the way network-based alerts already are
