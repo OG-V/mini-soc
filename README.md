@@ -4,7 +4,8 @@ A small but functioning Security Operations Center (SOC) pipeline, built as a po
 demonstrate practical skills in detection engineering, backend development, and system design.
 
 The system simulates a small organization's infrastructure, runs controlled attacks against it, and
-detects the resulting malicious activity through a real log collection → detection → alerting pipeline.
+detects the resulting malicious activity through a real log collection → detection → alerting →
+correlation pipeline.
 
 ## Status
 
@@ -18,10 +19,16 @@ detects the resulting malicious activity through a real log collection → detec
   target with signature-based detection of suspicious HTTP requests (SQLi, path traversal,
   sensitive-file probing)
 - ✅ Phase 6 — Live dashboard auto-refresh (polls the API every 5s, no manual refresh needed)
+- ✅ Phase 7 — Event correlation: alerts from the same source IP within a rolling time window are
+  grouped into a single incident (e.g. a recon scan followed by a brute-force attempt from the same
+  attacker), exposed via the API and a dedicated Incidents view in the dashboard, cross-linked with
+  alerts in both directions
 
 **Next up:**
-- ⬜ Phase 7+ — Event correlation across multiple attack stages, privilege escalation / file-change
-  scenarios, packet-level scan detection, full test coverage, one-command demo script
+- ⬜ Privilege escalation / file-change detection scenarios
+- ⬜ Packet-level scan detection (raw SYN scans)
+- ⬜ Full automated test coverage
+- ⬜ One-command demo script
 
 ## Detection rules
 
@@ -30,6 +37,9 @@ detects the resulting malicious activity through a real log collection → detec
 | `ssh_brute_force` | 4+ failed SSH logins from one IP within 60s | T1110 — Brute Force | `ssh-target` auth.log |
 | `ssh_recon_scan` | 2+ SSH banner-grab/recon probes from one IP within 60s | T1595 — Active Scanning | `ssh-target` auth.log |
 | `web_attack_probing` | 3+ suspicious HTTP requests from one IP within 60s | T1190 — Exploit Public-Facing Application | `web-target` access.log |
+
+Alerts fired by any of the above are further correlated: any two alerts from the same source IP
+within a 10-minute window are grouped into one **incident**, regardless of which rule(s) fired.
 
 ## Architecture (current)
 
@@ -59,16 +69,19 @@ detects the resulting malicious activity through a real log collection → detec
                          │
                          ▼
           [detection-engine/detector.py]  — polls events every 5s,
-          │                                  applies 3 threshold-based rules
+          │                                  applies 3 threshold-based rules,
+          │                                  then correlates new alerts into incidents
+          │                                  by source IP + time window
           ▼
-[PostgreSQL: alerts table]  — tagged with MITRE ATT&CK technique
-          │
+[PostgreSQL: alerts table] ──┐  [PostgreSQL: incidents table]
+          │                  └──────────────┘  (alerts.incident_id links the two)
           ▼
    [api/main.py]  — FastAPI REST API
-          │          GET /alerts, /alerts/{id}, /events
+          │          GET /alerts, /alerts/{id}, /incidents, /incidents/{id}, /events
           ▼
    [dashboard/]  — React (Vite) frontend
-                  polls /alerts every 5s; alert list + click-through incident timeline
+                  polls /alerts and /incidents every 5s; Alerts and Incidents tabs,
+                  cross-linked, with click-through incident timelines
 ```
 
 ## Components
@@ -78,11 +91,11 @@ detects the resulting malicious activity through a real log collection → detec
 | `ssh-target` | Docker, Ubuntu, OpenSSH, rsyslog | Simulated vulnerable Linux server |
 | `web-target` | Docker, nginx | Simulated web server; access log used for signature-based attack detection |
 | `attacker` | Docker, Kali Linux, Hydra, nmap, curl | Controlled attack execution |
-| `postgres` | PostgreSQL 16 | Stores structured events and alerts |
+| `postgres` | PostgreSQL 16 | Stores structured events, alerts, and incidents |
 | `log-collector/parser.py` | Python, psycopg2, threading | Tails auth.log and access.log concurrently, parses and normalizes log lines into the `events` table |
-| `detection-engine/detector.py` | Python, psycopg2 | Polls `events`, applies detection rules, writes `alerts` |
-| `api/main.py` | Python, FastAPI, uvicorn | REST API exposing alerts, alert detail with linked events, and raw events |
-| `dashboard/` | React, Vite | Web UI — live-polling alert list and incident timeline showing raw evidence per alert |
+| `detection-engine/detector.py` | Python, psycopg2 | Polls `events`, applies detection rules, writes `alerts`, and correlates new alerts into `incidents` by source IP + time window |
+| `api/main.py` | Python, FastAPI, uvicorn | REST API exposing alerts, alert detail with linked events, incidents, incident detail with linked alerts, and raw events |
+| `dashboard/` | React, Vite | Web UI — live-polling Alerts and Incidents tabs, cross-linked, with click-through incident timeline showing raw evidence per alert |
 
 ## Running it locally
 
@@ -133,9 +146,19 @@ curl "http://web-target/.env"
 curl "http://web-target/wp-login.php"
 ```
 
-With the dashboard open at `http://localhost:5173`, alerts appear automatically within a few seconds
-of an attack — no manual refresh needed. Click an alert to see its full incident timeline: the exact
-raw log lines that triggered it. Alerts are also retrievable via `curl http://localhost:8000/alerts`,
+**Correlated incident (recon followed by brute force from the same attacker):**
+```bash
+docker exec -it attacker bash
+nmap -sV -p 22 ssh-target
+nmap -sV -p 22 ssh-target
+hydra -l testuser -P /attacks/passwords.txt ssh://ssh-target
+```
+
+With the dashboard open at `http://localhost:5173`, alerts and incidents appear automatically
+within a few seconds of an attack — no manual refresh needed. Click an alert to see its full
+incident timeline: the exact raw log lines that triggered it, plus a link to its correlated
+incident if one exists. Click an incident to see every alert grouped into it. Data is also
+retrievable via `curl http://localhost:8000/alerts` or `curl http://localhost:8000/incidents`,
 or browsed via the auto-generated API docs at `http://localhost:8000/docs`.
 
 ## Design notes
@@ -152,6 +175,11 @@ or browsed via the auto-generated API docs at `http://localhost:8000/docs`.
   alert is created, every event that contributed to it is marked `alerted = TRUE` in the same
   transaction as the alert insert, so events are never double-counted across overlapping detection
   windows and the two tables can never drift out of sync with each other.
+- **Event correlation is streaming, not batch**: each newly created alert is correlated exactly
+  once, at creation time, against open incidents from the same source IP within a 10-minute window
+  — either attaching to an existing incident or starting a new one — rather than periodically
+  re-scanning the whole alerts table. This keeps correlation cheap regardless of how much history
+  accumulates, and requires no separate correlation job or schedule.
 - **The database schema is tracked in `db/schema.sql`** as the single source of truth, so the
   project can be set up from scratch without relying on manually-run `ALTER TABLE` commands.
 - **SSH recon detection required correlating two separate log lines** (a `Connection from ...` line
@@ -183,8 +211,6 @@ or browsed via the auto-generated API docs at `http://localhost:8000/docs`.
 
 ## Roadmap
 
-- Event correlation: linking related alerts across attack stages (e.g. a recon scan followed by a
-  brute-force attempt from the same IP) into a single incident narrative
 - Privilege escalation and file-integrity monitoring scenarios
 - Packet-level scan detection (raw SYN scans), likely via a lightweight `tcpdump`/`tshark` capture
   and threshold-based SYN/FIN counting, as a more complete alternative to the SSH-log-based approach
