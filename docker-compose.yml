@@ -2,6 +2,9 @@ services:
   ssh-target:
     build: .
     container_name: ssh-target
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
     ports:
       - "2222:22"
     volumes:

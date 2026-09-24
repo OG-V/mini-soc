@@ -18,6 +18,8 @@ RECON_THRESHOLD = 2
 RECON_WINDOW_SECONDS = 60
 WEB_ATTACK_THRESHOLD = 3
 WEB_ATTACK_WINDOW_SECONDS = 60
+PORT_SCAN_THRESHOLD = 5
+PORT_SCAN_WINDOW_SECONDS = 10
 
 # Correlation: alerts from the same source IP within this window are grouped
 # into a single incident, regardless of which rule(s) fired.
@@ -152,6 +154,61 @@ def create_web_attack_alert(conn, source_ip, request_count, first_id, last_id, e
     conn.commit()
     return alert_id
 
+def find_port_scan_candidates(conn):
+    """
+    Groups recent, not-yet-alerted syn_probe events by source_ip, returning
+    IPs that hit at least PORT_SCAN_THRESHOLD *distinct destination ports*
+    within the window. Unlike the other rules, this counts distinct ports,
+    not raw event count - a scan's signature is breadth across ports, not
+    repetition against one.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT source_ip,
+                   COUNT(DISTINCT dest_port) AS port_count,
+                   MIN(id) AS first_id,
+                   MAX(id) AS last_id,
+                   array_agg(id) AS event_ids
+            FROM events
+            WHERE event_type = 'syn_probe'
+              AND alerted = FALSE
+              AND event_time > now() - (%s || ' seconds')::interval
+            GROUP BY source_ip
+            HAVING COUNT(DISTINCT dest_port) >= %s
+            """,
+            (PORT_SCAN_WINDOW_SECONDS, PORT_SCAN_THRESHOLD),
+        )
+        return cur.fetchall()
+
+def create_port_scan_alert(conn, source_ip, port_count, first_id, last_id, event_ids):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO alerts (rule_name, mitre_technique, source_ip, username,
+                                 description, first_event_id, last_event_id, event_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                "port_scan_detected",
+                "T1046",
+                source_ip,
+                None,
+                f"{port_count} distinct ports probed by {source_ip} within {PORT_SCAN_WINDOW_SECONDS}s",
+                first_id,
+                last_id,
+                port_count,
+            ),
+        )
+        alert_id = cur.fetchone()[0]
+        cur.execute(
+            "UPDATE events SET alerted = TRUE WHERE id = ANY(%s)",
+            (event_ids,),
+        )
+    conn.commit()
+    return alert_id
+
 def create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, username):
     with conn.cursor() as cur:
         cur.execute(
@@ -236,7 +293,8 @@ def correlate_alert(conn, alert_id, source_ip, mitre_technique):
 
 def run():
     conn = psycopg2.connect(**DB_CONFIG)
-    print("Detection engine started. Polling for brute-force, recon, and web attack patterns, correlating into incidents...")
+    conn.autocommit = True
+    print("Detection engine started. Polling for brute-force, recon, web attack, and port scan patterns, correlating into incidents...")
     while True:
         candidates = find_brute_force_candidates(conn)
         for source_ip, failure_count, first_id, last_id, event_ids, usernames in candidates:
@@ -256,6 +314,12 @@ def run():
             alert_id = create_web_attack_alert(conn, source_ip, request_count, first_id, last_id, event_ids)
             correlate_alert(conn, alert_id, source_ip, "T1190")
             print(f"ALERT: web_attack_probing from {source_ip} ({request_count} requests)")
+
+        port_scan_candidates = find_port_scan_candidates(conn)
+        for source_ip, port_count, first_id, last_id, event_ids in port_scan_candidates:
+            alert_id = create_port_scan_alert(conn, source_ip, port_count, first_id, last_id, event_ids)
+            correlate_alert(conn, alert_id, source_ip, "T1046")
+            print(f"ALERT: port_scan_detected from {source_ip} ({port_count} ports)")
 
         time.sleep(POLL_INTERVAL_SECONDS)
 

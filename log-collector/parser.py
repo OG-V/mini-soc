@@ -41,7 +41,6 @@ RECON_PROBE_RE = re.compile(
 # a later "kex_exchange_identification" line back to the connection that caused it.
 pid_to_ip = {}
 
-
 def parse_ssh_line(line):
     """Try to match an auth.log line against known SSH patterns. Returns a dict or None."""
     match = FAILED_LOGIN_RE.match(line)
@@ -83,13 +82,11 @@ def parse_ssh_line(line):
 
     return None
 
-
 def parse_syslog_timestamp(timestamp_str):
     """Syslog timestamps have no year, so we assume the current year."""
     current_year = datetime.now().year
     dt = datetime.strptime(f"{current_year} {timestamp_str}", "%Y %b %d %H:%M:%S")
     return dt.replace(tzinfo=timezone.utc)
-
 
 # ---------------------------------------------------------------------------
 # HTTP log parsing (nginx access.log)
@@ -108,11 +105,9 @@ SUSPICIOUS_PATTERNS = [
     ".git/config", "phpmyadmin", "eval(", "base64_decode",
 ]
 
-
 def is_suspicious_path(path):
     decoded = unquote(path).lower()
     return any(pattern in decoded for pattern in SUSPICIOUS_PATTERNS)
-
 
 def parse_http_line(line):
     """Try to match an access.log line and flag suspicious request paths."""
@@ -132,11 +127,42 @@ def parse_http_line(line):
         "event_time": parse_nginx_timestamp(match.group("timestamp")),
     }
 
-
 def parse_nginx_timestamp(timestamp_str):
     """nginx timestamps include their own timezone offset, e.g. 23/Sep/2026:22:52:16 +0000."""
     return datetime.strptime(timestamp_str, "%d/%b/%Y:%H:%M:%S %z")
 
+# ---------------------------------------------------------------------------
+# Raw packet capture parsing (tcpdump SYN capture on ssh-target)
+# ---------------------------------------------------------------------------
+
+# Matches a tcpdump line for a bare SYN packet (SYN set, ACK not set - i.e. a
+# connection *attempt*, not a reply). tcpdump's own startup banner lines
+# ("tcpdump: verbose output suppressed...", "listening on eth0...") simply
+# won't match this and are silently skipped, same as any other unmatched line.
+SYN_PROBE_RE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+) IP "
+    r"(?P<src_ip>\d+\.\d+\.\d+\.\d+)\.\d+ > \d+\.\d+\.\d+\.\d+\.(?P<dst_port>\d+): Flags \[S\]"
+)
+
+def parse_synscan_line(line):
+    """Try to match a tcpdump SYN-capture line. Returns a dict or None."""
+    match = SYN_PROBE_RE.match(line)
+    if not match:
+        return None
+
+    return {
+        "event_type": "syn_probe",
+        "username": None,
+        "source_ip": match.group("src_ip"),
+        "source_host": "ssh-target",
+        "event_time": parse_tcpdump_timestamp(match.group("timestamp")),
+        "dest_port": int(match.group("dst_port")),
+    }
+
+def parse_tcpdump_timestamp(timestamp_str):
+    """tcpdump -tttt timestamps carry no timezone; the container clock runs in UTC."""
+    dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S.%f")
+    return dt.replace(tzinfo=timezone.utc)
 
 # ---------------------------------------------------------------------------
 # Shared insert + tail logic
@@ -146,8 +172,8 @@ def insert_event(conn, parsed, raw_line):
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO events (source_host, source_ip, event_type, username, raw_log, event_time)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO events (source_host, source_ip, event_type, username, raw_log, event_time, dest_port)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 parsed["source_host"],
@@ -156,10 +182,10 @@ def insert_event(conn, parsed, raw_line):
                 parsed["username"],
                 raw_line.strip(),
                 parsed["event_time"],
+                parsed.get("dest_port"),
             ),
         )
     conn.commit()
-
 
 def tail_log(filepath, parse_fn, label):
     """Follow a log file like `tail -f`, parsing and inserting new lines as they appear.
@@ -179,7 +205,6 @@ def tail_log(filepath, parse_fn, label):
                 insert_event(conn, parsed, line)
                 print(f"[{label}] Inserted: {parsed['event_type']} - {parsed['source_ip']}")
 
-
 if __name__ == "__main__":
     ssh_thread = threading.Thread(
         target=tail_log,
@@ -191,10 +216,17 @@ if __name__ == "__main__":
         args=("../logs/web-target/access.log", parse_http_line, "http"),
         daemon=True,
     )
+    synscan_thread = threading.Thread(
+        target=tail_log,
+        args=("../logs/ssh-target/tcpdump-syn.log", parse_synscan_line, "synscan"),
+        daemon=True,
+    )
 
     ssh_thread.start()
     http_thread.start()
+    synscan_thread.start()
 
-    # Keep the main thread alive while the two workers run in the background
+    # Keep the main thread alive while the three workers run in the background
     ssh_thread.join()
     http_thread.join()
+    synscan_thread.join()
