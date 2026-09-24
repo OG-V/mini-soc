@@ -19,6 +19,10 @@ RECON_WINDOW_SECONDS = 60
 WEB_ATTACK_THRESHOLD = 3
 WEB_ATTACK_WINDOW_SECONDS = 60
 
+# Correlation: alerts from the same source IP within this window are grouped
+# into a single incident, regardless of which rule(s) fired.
+CORRELATION_WINDOW_SECONDS = 600
+
 def find_brute_force_candidates(conn):
     """
     Groups recent, not-yet-alerted ssh_failed_login events by source_ip,
@@ -68,7 +72,6 @@ def find_recon_candidates(conn):
         )
         return cur.fetchall()
 
-
 def create_recon_alert(conn, source_ip, probe_count, first_id, last_id, event_ids):
     with conn.cursor() as cur:
         cur.execute(
@@ -76,6 +79,7 @@ def create_recon_alert(conn, source_ip, probe_count, first_id, last_id, event_id
             INSERT INTO alerts (rule_name, mitre_technique, source_ip, username,
                                  description, first_event_id, last_event_id, event_count)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
             """,
             (
                 "ssh_recon_scan",
@@ -88,11 +92,13 @@ def create_recon_alert(conn, source_ip, probe_count, first_id, last_id, event_id
                 probe_count,
             ),
         )
+        alert_id = cur.fetchone()[0]
         cur.execute(
             "UPDATE events SET alerted = TRUE WHERE id = ANY(%s)",
             (event_ids,),
         )
     conn.commit()
+    return alert_id
 
 def find_web_attack_candidates(conn):
     """
@@ -118,7 +124,6 @@ def find_web_attack_candidates(conn):
         )
         return cur.fetchall()
 
-
 def create_web_attack_alert(conn, source_ip, request_count, first_id, last_id, event_ids):
     with conn.cursor() as cur:
         cur.execute(
@@ -126,6 +131,7 @@ def create_web_attack_alert(conn, source_ip, request_count, first_id, last_id, e
             INSERT INTO alerts (rule_name, mitre_technique, source_ip, username,
                                  description, first_event_id, last_event_id, event_count)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
             """,
             (
                 "web_attack_probing",
@@ -138,11 +144,13 @@ def create_web_attack_alert(conn, source_ip, request_count, first_id, last_id, e
                 request_count,
             ),
         )
+        alert_id = cur.fetchone()[0]
         cur.execute(
             "UPDATE events SET alerted = TRUE WHERE id = ANY(%s)",
             (event_ids,),
         )
     conn.commit()
+    return alert_id
 
 def create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, username):
     with conn.cursor() as cur:
@@ -151,6 +159,7 @@ def create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, u
             INSERT INTO alerts (rule_name, mitre_technique, source_ip, username,
                                  description, first_event_id, last_event_id, event_count)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
             """,
             (
                 "ssh_brute_force",
@@ -163,31 +172,89 @@ def create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, u
                 failure_count,
             ),
         )
+        alert_id = cur.fetchone()[0]
         # Mark every event that contributed to this alert so it's never double-counted
         cur.execute(
             "UPDATE events SET alerted = TRUE WHERE id = ANY(%s)",
             (event_ids,),
         )
     conn.commit()
+    return alert_id
+
+def correlate_alert(conn, alert_id, source_ip, mitre_technique):
+    """
+    Attach a newly created alert to an open incident from the same source IP
+    within CORRELATION_WINDOW_SECONDS, or start a new incident if none exists.
+    This is what links, e.g., a recon scan and a later brute-force attempt
+    from the same attacker into a single incident, without hardcoding which
+    rule has to fire first.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id FROM incidents
+            WHERE source_ip = %s
+              AND status = 'open'
+              AND last_seen > now() - (%s || ' seconds')::interval
+            ORDER BY last_seen DESC
+            LIMIT 1
+            """,
+            (source_ip, CORRELATION_WINDOW_SECONDS),
+        )
+        existing = cur.fetchone()
+
+        if existing:
+            incident_id = existing[0]
+            cur.execute(
+                """
+                UPDATE incidents
+                SET last_seen = now(),
+                    alert_count = alert_count + 1,
+                    mitre_techniques = ARRAY(
+                        SELECT DISTINCT unnest(mitre_techniques || %s::text[])
+                    )
+                WHERE id = %s
+                """,
+                ([mitre_technique], incident_id),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO incidents (source_ip, first_seen, last_seen, alert_count, mitre_techniques)
+                VALUES (%s, now(), now(), 1, %s)
+                RETURNING id
+                """,
+                (source_ip, [mitre_technique]),
+            )
+            incident_id = cur.fetchone()[0]
+
+        cur.execute(
+            "UPDATE alerts SET incident_id = %s WHERE id = %s",
+            (incident_id, alert_id),
+        )
+    conn.commit()
 
 def run():
     conn = psycopg2.connect(**DB_CONFIG)
-    print("Detection engine started. Polling for brute-force, recon, and web attack patterns...")
+    print("Detection engine started. Polling for brute-force, recon, and web attack patterns, correlating into incidents...")
     while True:
         candidates = find_brute_force_candidates(conn)
         for source_ip, failure_count, first_id, last_id, event_ids, usernames in candidates:
             username = usernames[0]
-            create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, username)
+            alert_id = create_alert(conn, source_ip, failure_count, first_id, last_id, event_ids, username)
+            correlate_alert(conn, alert_id, source_ip, "T1110")
             print(f"ALERT: ssh_brute_force from {source_ip} ({failure_count} failures)")
 
         recon_candidates = find_recon_candidates(conn)
         for source_ip, probe_count, first_id, last_id, event_ids in recon_candidates:
-            create_recon_alert(conn, source_ip, probe_count, first_id, last_id, event_ids)
+            alert_id = create_recon_alert(conn, source_ip, probe_count, first_id, last_id, event_ids)
+            correlate_alert(conn, alert_id, source_ip, "T1595")
             print(f"ALERT: ssh_recon_scan from {source_ip} ({probe_count} probes)")
 
         web_candidates = find_web_attack_candidates(conn)
         for source_ip, request_count, first_id, last_id, event_ids in web_candidates:
-            create_web_attack_alert(conn, source_ip, request_count, first_id, last_id, event_ids)
+            alert_id = create_web_attack_alert(conn, source_ip, request_count, first_id, last_id, event_ids)
+            correlate_alert(conn, alert_id, source_ip, "T1190")
             print(f"ALERT: web_attack_probing from {source_ip} ({request_count} requests)")
 
         time.sleep(POLL_INTERVAL_SECONDS)
