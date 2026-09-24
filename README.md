@@ -31,10 +31,13 @@ detection → alerting → correlation pipeline.
   deliberate passwordless-sudo misconfiguration, and a background watcher hashes a set of
   security-critical files, flagging any unauthorized change (e.g. an attacker planting a backdoor
   key in `root`'s `authorized_keys`) and mapping it to the specific MITRE technique for that file.
+- ✅ Phase 10 — Automated tests for the log-parsing layer, and a one-command `./attack.sh` demo
+  script that fires every attack scenario in sequence against a running lab, producing a full
+  multi-stage incident on the dashboard from a single command.
 
-**Next up:**
-- ⬜ Full automated test coverage
-- ⬜ One-command demo script
+This project's planned roadmap is now complete. Possible future directions: process-level
+attribution for file-integrity violations (see Design notes), additional attack scenarios, and
+broader automated test coverage of the detection/API layers.
 
 ## Detection rules
 
@@ -54,7 +57,7 @@ participate in correlation.
 ## Architecture (current)
 
 ```
-[Attacker container: Kali + Hydra + nmap + curl + openssh-client]
+[Attacker container: Kali + Hydra + nmap + curl + openssh-client + sshpass]
         │
         ├─ SSH brute-force / recon / port scan / (post-login) priv-esc ──┐
         │                                                                 ▼
@@ -103,7 +106,7 @@ participate in correlation.
 |---|---|---|
 | `ssh-target` | Docker, Ubuntu, OpenSSH, rsyslog, tcpdump, bash | Simulated vulnerable Linux server: SSH auth logging, raw SYN capture (catches scans that never speak SSH), and a background file-integrity watcher over security-critical files. Ships a deliberate passwordless-sudo misconfiguration for the privilege-escalation scenario. |
 | `web-target` | Docker, nginx | Simulated web server; access log used for signature-based attack detection |
-| `attacker` | Docker, Kali Linux, Hydra, nmap, curl, openssh-client | Controlled attack execution |
+| `attacker` | Docker, Kali Linux, Hydra, nmap, curl, openssh-client, sshpass | Controlled attack execution, including non-interactive scripted scenarios |
 | `postgres` | PostgreSQL 16 | Stores structured events, alerts, and incidents |
 | `log-collector/parser.py` | Python, psycopg2, threading | Tails auth.log, access.log, the tcpdump SYN capture, and the file-integrity log concurrently, parses and normalizes lines into the `events` table |
 | `detection-engine/detector.py` | Python, psycopg2 | Polls `events`, applies detection rules, writes `alerts`, and correlates IP-attributed alerts into `incidents` by source IP + time window |
@@ -135,6 +138,25 @@ cd api && source venv/bin/activate && uvicorn main:app --reload --port 8000
 # Terminal 4 — dashboard
 cd dashboard && npm run dev
 ```
+
+With all four running, fire every attack scenario in sequence with one command:
+
+```bash
+./attack.sh
+```
+
+Or run any scenario individually — see below.
+
+### Running the tests
+
+```bash
+cd log-collector && source venv/bin/activate && python3 -m pytest -v
+```
+
+Covers the log-parsing layer (`parser.py`) — the SSH/HTTP/packet-capture/file-integrity line
+parsers, the stateful recon-scan PID correlation, and each timestamp parser's timezone handling.
+`detector.py` and the API are exercised by the attack scenarios below instead (see Design notes
+for why).
 
 ### Attack scenarios
 
@@ -182,6 +204,11 @@ docker exec -it attacker bash
 nmap -sV -p 22 ssh-target
 nmap -sV -p 22 ssh-target
 hydra -l testuser -P /attacks/passwords.txt ssh://ssh-target
+```
+
+**All of the above, non-interactively, in one command:**
+```bash
+./attack.sh
 ```
 
 With the dashboard open at `http://localhost:5173`, alerts and incidents appear automatically
@@ -268,7 +295,27 @@ or browsed via the auto-generated API docs at `http://localhost:8000/docs`.
   it by hand, which silently disappeared every time the image was rebuilt, breaking the brute-force
   scenario until the file was recreated. Baking it into the image makes the attacker container fully
   reproducible from a clean build, with no manual setup steps.
+- **Automated tests are scoped to `parser.py`'s parsing functions**, deliberately, not the whole
+  system. Those functions are pure (string in, dict out) and cover exactly the fiddly logic that
+  was manually re-verified by hand throughout development — regexes, timestamp formats, the
+  double-encoding evasion case, the stateful PID correlation. `detector.py` and the API are mostly
+  SQL executed against a live connection; meaningfully testing them would mean mocking psycopg2 or
+  standing up a real test database, a bigger investment than this project's size justified. That
+  logic is instead exercised by the attack scenarios and `attack.sh`, which is a legitimate (if
+  less automated) form of coverage for this scale of project.
+- **`attack.sh` assumes the lab is already running** (containers plus the four services in their
+  own terminals) rather than orchestrating everything itself — the same assumption a real
+  attack-simulation tool makes about its target environment. The one non-trivial part is running
+  the privilege-escalation step non-interactively: `sshpass` supplies the SSH password on the
+  command line, and piping the backdoor key into `sudo tee -a` over SSH's stdin avoids a painful
+  triple-nested-quoting problem that `ssh ... "sudo bash -c 'echo ... >> ...'"` would otherwise
+  create.
 
 ## Roadmap
 
-- Expanded automated test coverage and a one-command `./attack.sh` demo script
+This project's originally planned roadmap is complete. Possible future directions:
+
+- Process-level attribution for file-integrity violations (`auditd`/eBPF), to correlate those
+  alerts into incidents the way network-based alerts already are
+- Additional attack scenarios (e.g. lateral movement, data exfiltration)
+- Broader automated test coverage for `detector.py` and the API, likely via a test database
